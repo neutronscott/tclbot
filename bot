@@ -1,0 +1,149 @@
+#!/home/mute/bin/tclsh8.3
+
+set ::mynick neutronbot,neutrontcl
+set ::sasl_computed <printf 'user\0user\0password' | base64>
+
+# basically a comment of what I was running to test it each iteration
+set TEST_PROCEDURE {
+show event manager policy active
+event manager scheduler clear policy 5
+copy http://150.136.80.131/downloads/tclbot flash:/policies/bot.tcl
+conf t
+no event manager policy bot.tcl
+event manager policy bot.tcl
+end
+event manager run bot.tcl
+}
+
+# catch this so I can run it on non-cisco tclsh without issue
+catch {::cisco::eem::event_register_none maxrun 31536000}
+
+proc save_info {} {
+  set out [open "vars.txt" w]
+  puts $out [array get ::info]
+  close $out
+}
+
+proc load_info {} {
+  set in [open "vars.txt"]
+  array set ::info [read $in]
+  close $in
+}
+
+proc send {line} {
+  puts ">>> $line"
+  puts $::fd $line
+  flush $::fd
+}
+
+proc recv {line} {
+  #gets $::fd line
+
+  if {![regexp -- {:(\S+) (\S+) (\S+)(?: :?(.*))?} $line -> src cmd dst rest]} {
+    set src {}
+    set dst {}
+    regexp -- {(\S+) :?(.*)} $line -> cmd rest
+  }
+  if {![info exists cmd]} {
+    puts "no cmd parsed: $line"
+    return -1
+  }
+
+  switch $cmd {
+    002 - 003 - 004 - 005 - 250 - 251 - 252 - 253 - 254 - 
+    255 - 265 - 266 - 332 - 333 - 372 - 375 - 376 {
+      # saves from printing in default action because we don't care.
+    }
+    PING {send "PONG :$rest"}
+    PRIVMSG {cmd_privmsg $src $dst $rest}
+    001 {send "JOIN :#mute"}
+    433 send_nick
+
+    CAP {send "AUTHENTICATE PLAIN"}
+    AUTHENTICATE {send "AUTHENTICATE $::sasl_computed"}
+    903 {send "CAP END"}
+    904 {exit}
+
+    default {puts "<<< $line"}
+  }
+}
+
+proc reply {nick dst msg} {
+  if {$dst == $::curnick} {
+    send "PRIVMSG $nick :$msg"
+  } else {
+    send "PRIVMSG $dst :$nick: $msg"
+  }
+}
+
+proc cmd_privmsg {src dst msg} {
+  set nick [string range $src 0 [expr [string first ! $src] - 1]]
+  puts "::: \[$dst\] <$nick> $msg"
+
+  if {$dst == $::curnick && $nick == "mute" && [string match {eval *} $msg]} {
+    regexp -- {eval (.*)} $msg -> msg
+    catch $msg result
+    foreach line [split $result \n] {
+      send "PRIVMSG mute :$line"
+    }
+  }
+
+  if {[string match -nocase "$::curnick:*" $msg]} {
+    regexp -- {\S+: ?(.*)} $msg -> msg
+  } elseif {$dst == $::curnick} {
+    # continue
+  } else {
+    return
+  }
+
+  if {[regexp -nocase -- {^(?:what is\s+)?(\S+?)\??$} $msg -> word]} {
+    puts "--- word($word)"
+    if {[info exists ::info($word)]} {
+      reply $nick $dst $::info($word)
+    } else {
+      reply $nick $dst "I don't know."
+    }
+  } elseif {[regexp -nocase -- {^(\S+)\s+is\s+(.*)} $msg -> word def]} {
+    set ::info($word) $def
+    save_info
+  }
+}
+
+proc send_nick {} {
+  set nickarr [split $::mynick ,]
+
+  if {[info exists ::nicknum]} {
+    incr ::nicknum
+  } else {
+    set ::nicknum 0
+  }
+  if {$::nicknum >= [llength $nickarr]} {
+    set ::curnick [lindex $nickarr 0]$::nicknum
+  } else {
+    set ::curnick [lindex $nickarr $::nicknum]
+  }
+  send "NICK $::curnick"
+}
+
+proc bgerror message {
+  puts stderr ":::error::: $message"
+}
+
+proc main {} {
+  load_info
+
+  set ::fd [socket irc.libera.chat 6667]
+
+  send "CAP REQ :sasl"
+  send_nick
+  send "USER tcl 0 * :tclbot"
+
+  #fileevent $::fd readable recv
+  #vwait forever
+
+  while {[gets $::fd line] >= 0} {
+    recv $line
+  }
+}
+
+main
