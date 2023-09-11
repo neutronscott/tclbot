@@ -2,7 +2,7 @@
 
 set ::mynick neutronbot,neutrontcl
 set ::sasl_user mute
-set ::sasl_pass {wouldn't you like to know?}
+set ::sasl_pass [exec cat sekret]
 
 # basically a comment of what I was running to test it each iteration
 set TEST_PROCEDURE {
@@ -18,6 +18,13 @@ event manager run bot.tcl
 
 # catch this so I can run it on non-cisco tclsh without issue
 catch {::cisco::eem::event_register_none maxrun 31536000}
+
+# flood control: safe defaults.
+# allowance is increased by RATE units each second
+# each message costs PER units. MAX should be 5*PER to allow a burst of 5 messages.
+variable ::sendq_RATE 5 ::sendq_PER 8 ::sendq_MAX 40
+
+variable ::conn_state disconnected
 
 proc save_info {} {
   set out [open "info.txt" w]
@@ -39,8 +46,31 @@ proc send {line} {
   flush $::fd
 }
 
-proc recv {line} {
-  #gets $::fd line
+proc sendq {line} {
+  lappend ::sendq $line
+}
+
+proc sendq_dowork {} {
+  incr ::sendq_allowance $::sendq_RATE
+  if {$::sendq_allowance > $::sendq_MAX} {
+    set ::sendq_allowance $::sendq_MAX
+  }
+
+  if {![llength $::sendq]} {return}
+
+  while {[llength $::sendq] > 0 && $::sendq_allowance >= $::sendq_PER} {
+    send "[lindex $::sendq 0]"
+    set ::sendq [lrange $::sendq 1 end]
+    set ::sendq_allowance [expr {$::sendq_allowance - $::sendq_PER}]
+  }
+}
+
+proc recv {} {
+  gets $::fd line
+  if {[eof $::fd]} {
+    irc_disconnect
+    return
+  }
 
   if {![regexp -- {:(\S+) (\S+) (\S+)(?: :?(.*))?} $line -> src cmd dst rest]} {
     set src {}
@@ -59,12 +89,12 @@ proc recv {line} {
     }
     PING {send "PONG :$rest"}
     PRIVMSG {cmd_privmsg $src $dst $rest}
-    001 {send "JOIN :#mute"}
+    001 {sendq "JOIN :#mute"}
     433 send_nick
 
-    CAP {send "AUTHENTICATE PLAIN"}
+    CAP {sendq "AUTHENTICATE PLAIN"}
     AUTHENTICATE send_sasl
-    903 {send "CAP END"}
+    903 {sendq "CAP END"}
     904 {exit}
 
     default {puts "<<< $line"}
@@ -73,9 +103,9 @@ proc recv {line} {
 
 proc reply {nick dst msg} {
   if {$dst == $::curnick} {
-    send "PRIVMSG $nick :$msg"
+    sendq "PRIVMSG $nick :$msg"
   } else {
-    send "PRIVMSG $dst :$nick: $msg"
+    sendq "PRIVMSG $dst :$nick: $msg"
   }
 }
 
@@ -87,8 +117,9 @@ proc cmd_privmsg {src dst msg} {
     regexp -- {eval (.*)} $msg -> msg
     catch $msg result
     foreach line [split $result \n] {
-      send "PRIVMSG mute :$line"
+      sendq "PRIVMSG mute :$line"
     }
+    return
   }
 
   if {[string match -nocase "$::curnick:*" $msg]} {
@@ -115,17 +146,13 @@ proc cmd_privmsg {src dst msg} {
 proc send_nick {} {
   set nickarr [split $::mynick ,]
 
-  if {[info exists ::nicknum]} {
-    incr ::nicknum
-  } else {
-    set ::nicknum 0
-  }
   if {$::nicknum >= [llength $nickarr]} {
     set ::curnick [lindex $nickarr 0]$::nicknum
   } else {
     set ::curnick [lindex $nickarr $::nicknum]
   }
-  send "NICK $::curnick"
+  sendq "NICK $::curnick"
+  incr ::nicknum
 }
 
 proc send_sasl {} {
@@ -133,10 +160,10 @@ proc send_sasl {} {
     set ::sasl_computed [base64_encode "$::sasl_user\0$::sasl_user\0$::sasl_pass"]
   }
   for {set i 0} {$i < [string length $::sasl_computed]} {incr i 400} {
-    send "AUTHENTICATE [string range $::sasl_computed $i [expr {$i + 400}]]"
+    sendq "AUTHENTICATE [string range $::sasl_computed $i [expr {$i + 400}]]"
   }
   if {[string length $::sasl_computed] == $i} {
-    send "AUTHENTICATE +"
+    sendq "AUTHENTICATE +"
   }
 }
 
@@ -162,20 +189,36 @@ proc bgerror message {
   puts stderr ":::error::: $message"
 }
 
-proc main {} {
-  load_info
+proc irc_disconnect {} {
+  close $::fd
+  set ::conn_state disconnected
+  set ::sendq {}
+  after 10000 {irc_connect}
+}
+
+proc irc_connect {} {
+  set ::nicknum 0
+  set ::sendq_allowance $::sendq_MAX
+  set ::sendq {}
 
   set ::fd [socket irc.libera.chat 6667]
+  set ::conn_state connected
 
-  send "CAP REQ :sasl"
+  sendq "CAP REQ :sasl"
   send_nick
-  send "USER tcl 0 * :tclbot"
+  sendq "USER tcl 0 * :tclbot"
 
-  #fileevent $::fd readable recv
-  #vwait forever
+  fileevent $::fd readable recv
+}
 
-  while {[gets $::fd line] >= 0} {
-    recv $line
+proc main {} {
+  load_info
+  irc_connect
+
+  while {1} {
+    after 1000 {set timeout 1}
+    vwait timeout
+    sendq_dowork
   }
 }
 
