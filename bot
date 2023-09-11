@@ -71,11 +71,16 @@ proc recv {} {
     irc_disconnect
     return
   }
-
-  if {![regexp -- {:(\S+) (\S+) (\S+)(?: :?(.*))?} $line -> src cmd dst rest]} {
+  set tags {}
+  if {[regexp -- {^@(\S+)} $line -> tagstr]} {
+    set tags [split $tagstr {;}]
+    regsub -- {^@\S+\s+} $line {} line
+    puts "--- tags: $tags"
+  }
+  if {![regexp -- {^:(\S+) (\S+) (\S+)(?: :?(.*))?} $line -> src cmd dst rest]} {
     set src {}
     set dst {}
-    regexp -- {(\S+) :?(.*)} $line -> cmd rest
+    regexp -- {^(\S+) :?(.*)} $line -> cmd rest
   }
   if {![info exists cmd]} {
     puts "no cmd parsed: $line"
@@ -88,7 +93,7 @@ proc recv {} {
       # saves from printing in default action because we don't care.
     }
     PING {send "PONG :$rest"}
-    PRIVMSG {cmd_privmsg $src $dst $rest}
+    PRIVMSG {cmd_privmsg $tags $src $dst $rest}
     001 {sendq "JOIN :#mute"}
     433 send_nick
 
@@ -109,24 +114,25 @@ proc reply {nick dst msg} {
   }
 }
 
-proc cmd_privmsg {src dst msg} {
+proc cmd_privmsg {tags src dst msg} {
   set nick [string range $src 0 [expr [string first ! $src] - 1]]
   puts "::: \[$dst\] <$nick> $msg"
-
-  if {$dst == $::curnick && $nick == "mute" && [string match {eval *} $msg]} {
-    regexp -- {eval (.*)} $msg -> msg
-    catch $msg result
-    foreach line [split $result \n] {
-      sendq "PRIVMSG mute :$line"
-    }
-    return
-  }
 
   if {[string match -nocase "$::curnick:*" $msg]} {
     regexp -- {\S+: ?(.*)} $msg -> msg
   } elseif {$dst == $::curnick} {
     # continue
   } else {
+    return
+  }
+
+  if {[lsearch -exact $tags "account=mute"] != -1 && [string match {eval *} $msg]} {
+    regexp -- {eval (.*)} $msg -> msg
+    catch $msg result
+    foreach line [split $result \n] {
+      if {$line == {}} {set line { }}
+      reply $nick $dst $line
+    }
     return
   }
 
@@ -204,7 +210,7 @@ proc irc_connect {} {
   set ::fd [socket irc.libera.chat 6667]
   set ::conn_state connected
 
-  sendq "CAP REQ :sasl"
+  sendq "CAP REQ :sasl account-tag"
   send_nick
   sendq "USER tcl 0 * :tclbot"
 
