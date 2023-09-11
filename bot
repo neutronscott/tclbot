@@ -1,7 +1,8 @@
 #!/home/mute/bin/tclsh8.3
 
 set ::mynick neutronbot,neutrontcl
-set ::sasl_computed <printf 'user\0user\0password' | base64>
+set ::sasl_user mute
+set ::sasl_pass {wouldn't you like to know?}
 
 # basically a comment of what I was running to test it each iteration
 set TEST_PROCEDURE {
@@ -19,15 +20,17 @@ event manager run bot.tcl
 catch {::cisco::eem::event_register_none maxrun 31536000}
 
 proc save_info {} {
-  set out [open "vars.txt" w]
+  set out [open "info.txt" w]
   puts $out [array get ::info]
   close $out
 }
 
 proc load_info {} {
-  set in [open "vars.txt"]
-  array set ::info [read $in]
-  close $in
+  catch {
+    set in [open "info.txt"]
+    array set ::info [read $in]
+    close $in
+  }
 }
 
 proc send {line} {
@@ -60,7 +63,7 @@ proc recv {line} {
     433 send_nick
 
     CAP {send "AUTHENTICATE PLAIN"}
-    AUTHENTICATE {send "AUTHENTICATE $::sasl_computed"}
+    AUTHENTICATE send_sasl
     903 {send "CAP END"}
     904 {exit}
 
@@ -123,6 +126,36 @@ proc send_nick {} {
     set ::curnick [lindex $nickarr $::nicknum]
   }
   send "NICK $::curnick"
+}
+
+proc send_sasl {} {
+  if {![info exists ::sasl_computed]} {
+    set ::sasl_computed [base64_encode "$::sasl_user\0$::sasl_user\0$::sasl_pass"]
+  }
+  for {set i 0} {$i < [string length $::sasl_computed]} {incr i 400} {
+    send "AUTHENTICATE [string range $::sasl_computed $i [expr {$i + 400}]]"
+  }
+  if {[string length $::sasl_computed] == $i} {
+    send "AUTHENTICATE +"
+  }
+}
+
+proc base64_encode {str} {
+  set base64_en {
+    A B C D E F G H I J K L M N O P Q R S T U V W X Y Z \
+    a b c d e f g h i j k l m n o p q r s t u v w x y z \
+    0 1 2 3 4 5 6 7 8 9 + /
+  }
+  set result {}
+  binary scan $str c* X
+  foreach {x y z} $X {
+    set u [expr {$x<<16|[expr {$y!={}?$y:0}]<<8|[expr {$z!={}?$z:0}]}]
+    append result [lindex $base64_en [expr {$u>>18}]]
+    append result [lindex $base64_en [expr {$u>>12&63}]]
+    append result [expr {$y=={}?"=":[lindex $base64_en [expr {$u>>6&63}]]}]
+    append result [expr {$z=={}?"=":[lindex $base64_en [expr {$u&63}]]}]
+  }
+  return $result
 }
 
 proc bgerror message {
