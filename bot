@@ -1,6 +1,7 @@
 #!/home/mute/bin/tclsh8.3
 
 set ::mynick neutronbot,neutrontcl
+set ::channels {#mute}
 set ::sasl_user mute
 set ::sasl_pass [exec cat sekret]
 
@@ -25,6 +26,7 @@ catch {::cisco::eem::event_register_none maxrun 31536000}
 variable ::sendq_RATE 5 ::sendq_PER 8 ::sendq_MAX 40
 
 variable ::conn_state disconnected
+variable ::dcc_host {} ::dcc_incoming {} ::dcc_socket {}
 
 proc save_info {} {
   set out [open "info.txt" w]
@@ -41,7 +43,6 @@ proc load_info {} {
 }
 
 proc send {line} {
-  puts ">>> $line"
   puts $::fd $line
   flush $::fd
 }
@@ -75,7 +76,6 @@ proc recv {} {
   if {[regexp -- {^@(\S+)} $line -> tagstr]} {
     set tags [split $tagstr {;}]
     regsub -- {^@\S+\s+} $line {} line
-    puts "--- tags: $tags"
   }
   if {![regexp -- {^:(\S+) (\S+) (\S+)(?: :?(.*))?} $line -> src cmd dst rest]} {
     set src {}
@@ -94,8 +94,9 @@ proc recv {} {
     }
     PING {send "PONG :$rest"}
     PRIVMSG {cmd_privmsg $tags $src $dst $rest}
-    001 {sendq "JOIN :#mute"}
-    433 send_nick
+    001 {cmd_001}
+    338 {cmd_338 $rest}
+    433 {send_nick}
 
     CAP {sendq "AUTHENTICATE PLAIN"}
     AUTHENTICATE send_sasl
@@ -109,13 +110,60 @@ proc recv {} {
 proc reply {nick dst msg} {
   if {$dst == $::curnick} {
     sendq "PRIVMSG $nick :$msg"
+    puts "::: \[$nick\] <$::curnick> $msg"
+  } elseif {[regexp -- {^dcc=(.*)$} $dst -> sock]} {
+    puts $sock $msg
+    puts "::: DCC \[$nick\] $msg"
   } else {
+    puts "::: \[$dst\] <$::curnick> $nick: $msg"
     sendq "PRIVMSG $dst :$nick: $msg"
   }
 }
 
+proc ctcp_reply {nick msg} {
+  puts "--- CTCP reply <$nick>: $msg"
+  sendq "NOTICE $nick :\001$msg\001"
+}
+
+proc cmd_001 {} {
+  sendq "WHOIS $::curnick"
+  foreach c $::channels {
+    sendq "JOIN $c"
+  }
+}
+
+proc cmd_338 {rest} {
+  if {[regexp -- {^(\S+)\s(\S+)} $rest -> who ip]} {
+    if {$who == $::curnick} {
+      puts "*** My actual IP: $ip"
+      # TODO(mute): must be a [binary format] for this...
+      set longip 0
+      set shift 32
+      foreach i [split $ip .] {
+        incr shift -8
+        incr longip [expr {$i<<$shift}]
+      }
+      set ::dcc_host $longip
+    }
+  }
+}
+
+proc cmd_ctcp {nick dst cmd rest} {
+  puts "--- CTCP request <$nick>: $cmd $rest"
+  switch $cmd {
+    VERSION {ctcp_reply $nick "VERSION tclbot https://github.com/neutronscott/tclbot"}
+    PING {ctcp_reply $nick "PING $rest"}
+  } 
+}
+
 proc cmd_privmsg {tags src dst msg} {
   set nick [string range $src 0 [expr [string first ! $src] - 1]]
+
+  if {[regexp -- {^\001(\S+)(?:\s?(.*))?\001} $msg -> cmd rest]} {
+    cmd_ctcp $nick $dst $cmd $rest
+    return
+  }
+
   puts "::: \[$dst\] <$nick> $msg"
 
   if {[string match -nocase "$::curnick:*" $msg]} {
@@ -126,6 +174,11 @@ proc cmd_privmsg {tags src dst msg} {
     return
   }
 
+  h_cmd $nick $dst $msg $tags
+}
+
+proc h_cmd {nick dst msg {tags --}} {
+  puts "h_cmd $nick $dst $msg $tags"
   if {[lsearch -exact $tags "account=mute"] != -1 && [string match {eval *} $msg]} {
     regexp -- {eval (.*)} $msg -> msg
     catch $msg result
@@ -137,7 +190,6 @@ proc cmd_privmsg {tags src dst msg} {
   }
 
   if {[regexp -nocase -- {^(?:what is\s+)?(\S+?)\??$} $msg -> word]} {
-    puts "--- word($word)"
     if {[info exists ::info($word)]} {
       reply $nick $dst $::info($word)
     } else {
@@ -146,7 +198,74 @@ proc cmd_privmsg {tags src dst msg} {
   } elseif {[regexp -nocase -- {^(\S+)\s+is\s+(.*)} $msg -> word def]} {
     set ::info($word) $def
     save_info
+  } elseif {[string match -nocase {chat me} $msg]} {
+    dcc_chat $nick $tags
   }
+}
+
+proc dcc_putsall {msg} {
+  foreach s [array names ::dcc_nick] {
+    puts $s "$msg"
+  }
+}
+
+proc dcc_close {nick sock} {
+  unset ::dcc_nick($sock)
+  close $sock
+  dcc_putsall "*** $nick has left the party chat." 
+}
+
+proc dcc_recv {sock} {
+  set nick $::dcc_nick($sock)
+  gets $sock line
+  if {[eof $sock]} {
+    dcc_close $nick $sock
+    return
+  }
+
+  if {[regexp -nocase -- {^\001ACTION\s+(.*)\001$} $line -> emote]} {
+    puts "::: DCC<$nick> $line"
+    dcc_putsall "*** $nick $emote"
+  } elseif {[regexp -nocase -- {^\.(.*)$} $line -> msg]} {
+    h_cmd $nick "dcc=$sock" $msg $::dcc_tags($sock)
+  } else {
+    puts "::: DCC<$nick>: $line"
+    dcc_putsall "<$nick> $line"
+  }
+}
+
+proc dcc_chat_accept {sock addr port} {
+  fconfigure $sock -buffering line -translation crlf
+  if {$::dcc_incoming == {}} {
+    puts $sock "Invites expire after 30 sec. Please try again."
+    close $sock
+    return
+  }
+  set ::dcc_nick($sock) [lindex $::dcc_incoming 0]
+  set ::dcc_tags($sock) [lindex $::dcc_incoming 1]
+  puts "*** DCC CHAT client socket: $sock $addr $port"
+  dcc_putsall "*** $::dcc_incoming has joined the party chat."
+  fileevent $sock readable [list dcc_recv $sock]
+  unset ::dcc_incoming
+}
+
+proc dcc_chat {nick tags} {
+  if {$::dcc_incoming != {}} {
+    sendq "NOTICE $nick :I'm awaiting another connection. Please try again later."
+    return
+  }
+  set ::dcc_incoming [list $nick $tags]
+  if {$::dcc_socket == {}} {
+    set sock [socket -server dcc_chat_accept 0]
+    set ::dcc_socket $sock
+  } else {
+    set sock $::dcc_socket
+  }
+  set port [lindex [fconfigure $sock -sockname] 2]
+
+  puts "*** DCC CHAT listen socket: $sock"
+  sendq "PRIVMSG $nick :\001DCC CHAT chat $::dcc_host $port\001"
+  after 30000 {set ::dcc_incoming {}}
 }
 
 proc send_nick {} {
@@ -192,7 +311,7 @@ proc base64_encode {str} {
 }
 
 proc bgerror message {
-  puts stderr ":::error::: $message"
+  puts stderr $::errorInfo
 }
 
 proc irc_disconnect {} {
@@ -208,6 +327,7 @@ proc irc_connect {} {
   set ::sendq {}
 
   set ::fd [socket irc.libera.chat 6667]
+  fconfigure $::fd -buffering line -translation crlf
   set ::conn_state connected
 
   sendq "CAP REQ :sasl account-tag"
