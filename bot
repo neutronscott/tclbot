@@ -242,8 +242,7 @@ proc is_admin {tags} {
 }
 
 proc flagchk {dst flags tags} {
-  puts "flagchk: dst($dst) flags($flags) tags($tags)"
-  if {[string match {*a*} $flags]} {
+  if {[string match {*a*} $flags] && ![is_admin $tags]} {
     return 0
   }
 
