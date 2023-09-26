@@ -42,13 +42,12 @@ proc load_info {} {
   }
 }
 
-proc send {line} {
-  puts $::fd $line
-  flush $::fd
-}
-
-proc sendq {line} {
-  lappend ::sendq $line
+proc send {line {head 0}} {
+  if {$head == 1} {
+    set ::sendq [list $line $::sendq]
+  } else {
+    lappend ::sendq $line
+  }
 }
 
 proc sendq_dowork {} {
@@ -60,7 +59,7 @@ proc sendq_dowork {} {
   if {![llength $::sendq]} {return}
 
   while {[llength $::sendq] > 0 && $::sendq_allowance >= $::sendq_PER} {
-    send "[lindex $::sendq 0]"
+    puts $::fd "[lindex $::sendq 0]"
     set ::sendq [lrange $::sendq 1 end]
     set ::sendq_allowance [expr {$::sendq_allowance - $::sendq_PER}]
   }
@@ -92,15 +91,16 @@ proc recv {} {
     255 - 265 - 266 - 332 - 333 - 372 - 375 - 376 {
       # saves from printing in default action because we don't care.
     }
-    PING {send "PONG :$rest"}
+    INVITE {cmd_invite $tags $src $dst $rest}
+    PING {send "PONG :$rest" 1}
     PRIVMSG {cmd_privmsg $tags $src $dst $rest}
     001 {cmd_001}
     338 {cmd_338 $rest}
     433 {send_nick}
 
-    CAP {sendq "AUTHENTICATE PLAIN"}
+    CAP {send "AUTHENTICATE PLAIN"}
     AUTHENTICATE send_sasl
-    903 {sendq "CAP END"}
+    903 {send "CAP END"}
     904 {exit}
 
     default {puts "<<< $line"}
@@ -109,26 +109,26 @@ proc recv {} {
 
 proc reply {nick dst msg} {
   if {$dst == $::curnick} {
-    sendq "PRIVMSG $nick :$msg"
+    send "PRIVMSG $nick :$msg"
     puts "::: \[$nick\] <$::curnick> $msg"
   } elseif {[regexp -- {^dcc=(.*)$} $dst -> sock]} {
     puts $sock $msg
     puts "::: DCC \[$nick\] $msg"
   } else {
     puts "::: \[$dst\] <$::curnick> $nick: $msg"
-    sendq "PRIVMSG $dst :$nick: $msg"
+    send "PRIVMSG $dst :$nick: $msg"
   }
 }
 
 proc ctcp_reply {nick msg} {
   puts "--- CTCP reply <$nick>: $msg"
-  sendq "NOTICE $nick :\001$msg\001"
+  send "NOTICE $nick :\001$msg\001"
 }
 
 proc cmd_001 {} {
-  sendq "WHOIS $::curnick"
+  send "WHOIS $::curnick"
   foreach c $::channels {
-    sendq "JOIN $c"
+    send "JOIN $c"
   }
 }
 
@@ -151,11 +151,17 @@ proc cmd_338 {rest} {
 proc cmd_ctcp {nick dst cmd rest} {
   puts "--- CTCP request <$nick>: $cmd $rest"
   switch $cmd {
-    DCC {sendq "NOTICE $nick :I don't trust DCC. Message me \"chat me\""}
+    DCC {send "NOTICE $nick :I don't trust DCC. Message me \"chat me\""}
     PING {ctcp_reply $nick "PING $rest"}
     TIME {ctcp_reply $nick [clock format [clock seconds] -format "%a, %d %b %Y %H:%M:%S %z"]}
     VERSION {ctcp_reply $nick "VERSION tclbot https://github.com/neutronscott/tclbot"}
   } 
+}
+
+proc cmd_invite {tags src dst rest} {
+  if {[is_admin $tags]} {
+    send "JOIN $rest" 1
+  }
 }
 
 proc cmd_privmsg {tags src dst msg} {
@@ -183,7 +189,9 @@ proc c_info {nick dst args} {
   set word [lindex $args 1]
 
   if {[info exists ::info($word)]} {
-    reply $nick $dst $::info($word)
+    foreach line [split $::info($word) \n] {
+      reply $nick $dst $line
+    }
   } else {
     reply $nick $dst "I don't know."
   }
@@ -203,6 +211,10 @@ proc c_eval {nick dst args} {
   }
 }
 
+proc c_op {nick dst args} {
+  send "MODE $dst +o $nick" 1
+}
+
 proc c_whoami {tags nick dst args} {
   reply $nick $dst "You are $nick (tags: $tags) (admin: [expr {[is_admin $tags] ? "yes" : "no"}])"
 }
@@ -218,7 +230,7 @@ proc c_who {nick dst args} {
 proc c_chat {tags nick dst args} {
   puts "c_chat tags($tags) nick($nick) dst($dst) args($args)"
   if {$::dcc_incoming != {}} {
-    sendq "NOTICE $nick :I'm awaiting another connection. Please try again later."
+    send "NOTICE $nick :I'm awaiting another connection. Please try again later."
     return
   }
   set ::dcc_incoming [list $nick $tags]
@@ -232,7 +244,7 @@ proc c_chat {tags nick dst args} {
   }
 
   puts "*** DCC CHAT listen socket: $sock"
-  sendq "PRIVMSG $nick :\001DCC CHAT chat $::dcc_host $port\001"
+  send "PRIVMSG $nick :\001DCC CHAT chat $::dcc_host $port\001"
   after 30000 {set ::dcc_incoming {}}
 }
 
@@ -265,9 +277,11 @@ proc h_cmd {nick dst msg {tags --}} {
   # p - private message
   set cmd_table {
     { {^eval (.*)$} adp c_eval }
+    { {^op me$} ac c_op }
+
     { {^chat me} cp {c_chat $tags} }
-    { {^whoami} cdp {c_whoami $tags} }
-    { {^who} cdp {c_who} }
+    { {^whoami$} cdp {c_whoami $tags} }
+    { {^who$} cdp {c_who} }
 
     { {^(?:what is\s+)?(\S+?)\??$} cdp c_info }
     { {^(\S+)\s+is\s+(.*)} c c_define }
@@ -339,7 +353,7 @@ proc send_nick {} {
   } else {
     set ::curnick [lindex $nickarr $::nicknum]
   }
-  sendq "NICK $::curnick"
+  send "NICK $::curnick"
   incr ::nicknum
 }
 
@@ -348,10 +362,10 @@ proc send_sasl {} {
     set ::sasl_computed [base64_encode "$::sasl_user\0$::sasl_user\0$::sasl_pass"]
   }
   for {set i 0} {$i < [string length $::sasl_computed]} {incr i 400} {
-    sendq "AUTHENTICATE [string range $::sasl_computed $i [expr {$i + 400}]]"
+    send "AUTHENTICATE [string range $::sasl_computed $i [expr {$i + 400}]]"
   }
   if {[string length $::sasl_computed] == $i} {
-    sendq "AUTHENTICATE +"
+    send "AUTHENTICATE +"
   }
 }
 
@@ -393,9 +407,9 @@ proc irc_connect {} {
   fconfigure $::fd -buffering line -translation crlf
   set ::conn_state connected
 
-  sendq "CAP REQ :sasl account-tag"
+  send "CAP REQ :sasl account-tag"
   send_nick
-  sendq "USER tcl 0 * :tclbot"
+  send "USER tcl 0 * :tclbot"
 
   fileevent $::fd readable recv
 }
