@@ -151,8 +151,10 @@ proc cmd_338 {rest} {
 proc cmd_ctcp {nick dst cmd rest} {
   puts "--- CTCP request <$nick>: $cmd $rest"
   switch $cmd {
-    VERSION {ctcp_reply $nick "VERSION tclbot https://github.com/neutronscott/tclbot"}
+    DCC {sendq "NOTICE $nick :I don't trust DCC. Message me \"chat me\""}
     PING {ctcp_reply $nick "PING $rest"}
+    TIME {ctcp_reply $nick [clock format [clock seconds] -format "%a, %d %b %Y %H:%M:%S %z"]}
+    VERSION {ctcp_reply $nick "VERSION tclbot https://github.com/neutronscott/tclbot"}
   } 
 }
 
@@ -177,29 +179,109 @@ proc cmd_privmsg {tags src dst msg} {
   h_cmd $nick $dst $msg $tags
 }
 
-proc h_cmd {nick dst msg {tags --}} {
-  puts "h_cmd $nick $dst $msg $tags"
-  if {[lsearch -exact $tags "account=mute"] != -1 && [string match {eval *} $msg]} {
-    regexp -- {eval (.*)} $msg -> msg
-    catch $msg result
-    foreach line [split $result \n] {
-      if {$line == {}} {set line { }}
-      reply $nick $dst $line
-    }
+proc c_info {nick dst args} {
+  set word [lindex $args 1]
+
+  if {[info exists ::info($word)]} {
+    reply $nick $dst $::info($word)
+  } else {
+    reply $nick $dst "I don't know."
+  }
+}
+
+proc c_define {nick dst args} {
+  set ::info([lindex $args 1]) [lindex $args 2]
+  reply $nick $dst "Ok."
+  save_info
+}
+
+proc c_eval {nick dst args} {
+  catch [lindex $args 1] result
+  foreach line [split $result \n] {
+    if {$line == {}} {set line { }}
+    reply $nick $dst $line
+  }
+}
+
+proc c_whoami {tags nick dst args} {
+  reply $nick $dst "You are $nick (tags: $tags) (admin: [expr {[is_admin $tags] ? "yes" : "no"}])"
+}
+
+proc c_who {nick dst args} {
+  set i 0
+  foreach s [array names ::dcc_nick] {
+    incr i
+    reply $nick $dst "[format %3d $i] $::dcc_nick($s)"
+  }
+}
+
+proc c_chat {tags nick dst args} {
+  puts "c_chat tags($tags) nick($nick) dst($dst) args($args)"
+  if {$::dcc_incoming != {}} {
+    sendq "NOTICE $nick :I'm awaiting another connection. Please try again later."
     return
   }
+  set ::dcc_incoming [list $nick $tags]
+  if {$::dcc_socket == {}} {
+    set sock [socket -server dcc_chat_accept 0]
+    set port [lindex [fconfigure $sock -sockname] 2]
+    set ::dcc_socket [list $sock $port]
+  } else {
+    set sock [lindex $::dcc_socket 0]
+    set port [lindex $::dcc_socket 1]
+  }
 
-  if {[regexp -nocase -- {^(?:what is\s+)?(\S+?)\??$} $msg -> word]} {
-    if {[info exists ::info($word)]} {
-      reply $nick $dst $::info($word)
-    } else {
-      reply $nick $dst "I don't know."
+  puts "*** DCC CHAT listen socket: $sock"
+  sendq "PRIVMSG $nick :\001DCC CHAT chat $::dcc_host $port\001"
+  after 30000 {set ::dcc_incoming {}}
+}
+
+proc is_admin {tags} {
+  # TODO(mute): needs an ACL with different checks than just CAP tags
+  return [expr {$tags == "account=mute"}]
+}
+
+proc flagchk {dst flags tags} {
+  puts "flagchk: dst($dst) flags($flags) tags($tags)"
+  if {[string match {*a*} $flags]} {
+    return 0
+  }
+
+  if {[string match {*p*} $flags] && $dst == $::curnick} {
+    return 1
+  } elseif {[string match {*d*} $flags] && [regexp -- {^dcc=(.*)$} $dst -> sock]} {
+    return 1
+  } elseif {[string match {*c*} $flags]} {
+    return 1
+  }
+  return 0
+}
+
+proc h_cmd {nick dst msg {tags --}} {
+  # { {pattern flags proc} }
+  # flags:
+  # a - require admin
+  # c - channel
+  # d - dcc chat
+  # p - private message
+  set cmd_table {
+    { {^eval (.*)$} adp c_eval }
+    { {^chat me} cp {c_chat $tags} }
+    { {^whoami} cdp {c_whoami $tags} }
+    { {^who} cdp {c_who} }
+
+    { {^(?:what is\s+)?(\S+?)\??$} cdp c_info }
+    { {^(\S+)\s+is\s+(.*)} c c_define }
+  }
+
+  foreach entry $cmd_table {
+    foreach {pattern flags proc} $entry {
+      set args [regexp -nocase -inline -- $pattern $msg]
+      if {$args != {} && [flagchk $dst $flags $tags]} {
+        eval $proc $nick $dst $args
+        return
+      }
     }
-  } elseif {[regexp -nocase -- {^(\S+)\s+is\s+(.*)} $msg -> word def]} {
-    set ::info($word) $def
-    save_info
-  } elseif {[string match -nocase {chat me} $msg]} {
-    dcc_chat $nick $tags
   }
 }
 
@@ -244,29 +326,11 @@ proc dcc_chat_accept {sock addr port} {
   set ::dcc_nick($sock) [lindex $::dcc_incoming 0]
   set ::dcc_tags($sock) [lindex $::dcc_incoming 1]
   puts "*** DCC CHAT client socket: $sock $addr $port"
-  dcc_putsall "*** $::dcc_incoming has joined the party chat."
+  dcc_putsall "*** $::dcc_nick($sock) has joined the party chat."
   fileevent $sock readable [list dcc_recv $sock]
   unset ::dcc_incoming
 }
 
-proc dcc_chat {nick tags} {
-  if {$::dcc_incoming != {}} {
-    sendq "NOTICE $nick :I'm awaiting another connection. Please try again later."
-    return
-  }
-  set ::dcc_incoming [list $nick $tags]
-  if {$::dcc_socket == {}} {
-    set sock [socket -server dcc_chat_accept 0]
-    set ::dcc_socket $sock
-  } else {
-    set sock $::dcc_socket
-  }
-  set port [lindex [fconfigure $sock -sockname] 2]
-
-  puts "*** DCC CHAT listen socket: $sock"
-  sendq "PRIVMSG $nick :\001DCC CHAT chat $::dcc_host $port\001"
-  after 30000 {set ::dcc_incoming {}}
-}
 
 proc send_nick {} {
   set nickarr [split $::mynick ,]
