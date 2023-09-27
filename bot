@@ -82,7 +82,6 @@ proc recv {} {
     regexp -- {^(\S+) :?(.*)} $line -> cmd rest
   }
   if {![info exists cmd]} {
-    puts "no cmd parsed: $line"
     return -1
   }
 
@@ -92,6 +91,7 @@ proc recv {} {
       # saves from printing in default action because we don't care.
     }
     INVITE {cmd_invite $tags $src $dst $rest}
+    NOTICE {cmd_notice $src $dst $rest}
     PING {send "PONG :$rest" 1}
     PRIVMSG {cmd_privmsg $tags $src $dst $rest}
     001 {cmd_001}
@@ -109,19 +109,19 @@ proc recv {} {
 
 proc reply {nick dst msg} {
   if {$dst == $::curnick} {
+    puts "\[MSG:$nick\] <$::curnick> $msg"
     send "PRIVMSG $nick :$msg"
-    puts "::: \[$nick\] <$::curnick> $msg"
   } elseif {[regexp -- {^dcc=(.*)$} $dst -> sock]} {
+    puts "\[DCC:$nick\] <$::curnick> $msg"
     puts $sock $msg
-    puts "::: DCC \[$nick\] $msg"
   } else {
-    puts "::: \[$dst\] <$::curnick> $nick: $msg"
+    puts "\[$dst\] <$::curnick> $nick: $msg"
     send "PRIVMSG $dst :$nick: $msg"
   }
 }
 
 proc ctcp_reply {nick msg} {
-  puts "--- CTCP reply <$nick>: $msg"
+  puts "*** CTCP reply <$nick>: $msg"
   send "NOTICE $nick :\001$msg\001"
 }
 
@@ -135,7 +135,6 @@ proc cmd_001 {} {
 proc cmd_338 {rest} {
   if {[regexp -- {^(\S+)\s(\S+)} $rest -> who ip]} {
     if {$who == $::curnick} {
-      puts "*** My actual IP: $ip"
       # TODO(mute): must be a [binary format] for this...
       set longip 0
       set shift 32
@@ -149,7 +148,11 @@ proc cmd_338 {rest} {
 }
 
 proc cmd_ctcp {nick dst cmd rest} {
-  puts "--- CTCP request <$nick>: $cmd $rest"
+  if {$cmd == "ACTION"} {
+    puts "\[[expr {$dst == $::curnick ? "MSG:$nick" : $dst}]\] *** $nick $rest"
+    return
+  }
+  puts "*** CTCP request <$nick>: $cmd $rest"
   switch $cmd {
     DCC {send "NOTICE $nick :I don't trust DCC. Message me \"chat me\""}
     PING {ctcp_reply $nick "PING $rest"}
@@ -164,6 +167,19 @@ proc cmd_invite {tags src dst rest} {
   }
 }
 
+proc cmd_notice {src dst msg} {
+  if {$dst == "*"} {
+    puts "$msg"
+  } elseif {[string match {*!*} $src]} {
+    set nick [string range $src 0 [expr [string first ! $src] - 1]]
+    if {$dst == $::curnick} {
+      puts "\[MSG:$nick\] -$nick- $msg"
+    } else {
+      puts "\[$dst\] -$nick- $msg"
+    }
+  }
+}
+
 proc cmd_privmsg {tags src dst msg} {
   set nick [string range $src 0 [expr [string first ! $src] - 1]]
 
@@ -172,7 +188,7 @@ proc cmd_privmsg {tags src dst msg} {
     return
   }
 
-  puts "::: \[$dst\] <$nick> $msg"
+  puts "\[[expr {$dst == $::curnick ? "MSG:$nick" : $dst}]\] <$nick> $msg"
 
   if {[string match -nocase "$::curnick:*" $msg]} {
     regexp -- {\S+: ?(.*)} $msg -> msg
@@ -185,9 +201,7 @@ proc cmd_privmsg {tags src dst msg} {
   h_cmd $nick $dst $msg $tags
 }
 
-proc c_info {nick dst args} {
-  set word [lindex $args 1]
-
+proc c_info {nick dst word} {
   if {[info exists ::info($word)]} {
     foreach line [split $::info($word) \n] {
       reply $nick $dst $line
@@ -197,8 +211,12 @@ proc c_info {nick dst args} {
   }
 }
 
-proc c_define {nick dst args} {
-  set ::info([lindex $args 1]) [lindex $args 2]
+proc c_define {nick dst word def} {
+  if {[info exist ::info($word)]} {
+    reply $nick $dst "I already know that."
+    return
+  }
+  set ::info($word) $def
   reply $nick $dst "Ok."
   save_info
 }
@@ -228,7 +246,6 @@ proc c_who {nick dst args} {
 }
 
 proc c_chat {tags nick dst args} {
-  puts "c_chat tags($tags) nick($nick) dst($dst) args($args)"
   if {$::dcc_incoming != {}} {
     send "NOTICE $nick :I'm awaiting another connection. Please try again later."
     return
@@ -245,7 +262,10 @@ proc c_chat {tags nick dst args} {
 
   puts "*** DCC CHAT listen socket: $sock"
   send "PRIVMSG $nick :\001DCC CHAT chat $::dcc_host $port\001"
-  after 30000 {set ::dcc_incoming {}}
+  set ::dcc_timer [after 30000 {
+    send "NOTICE [lindex $::dcc_incoming 0] :DCC CHAT request timed out."
+    set ::dcc_incoming {}
+  }]
 }
 
 proc is_admin {tags} {
@@ -253,7 +273,7 @@ proc is_admin {tags} {
   return [expr {$tags == "account=mute"}]
 }
 
-proc flagchk {dst flags tags} {
+proc flagchk {dst flags {tags {}}} {
   if {[string match {*a*} $flags] && ![is_admin $tags]} {
     return 0
   }
@@ -262,40 +282,65 @@ proc flagchk {dst flags tags} {
     return 1
   } elseif {[string match {*d*} $flags] && [regexp -- {^dcc=(.*)$} $dst -> sock]} {
     return 1
-  } elseif {[string match {*c*} $flags]} {
+  } elseif {[string match {*c*} $flags] && [string match {#*} $dst]} {
     return 1
   }
   return 0
 }
 
+proc c_help_chan {cmd_table tags nick dst args} {
+  set cmdlist {}
+  foreach entry $cmd_table {
+    foreach {cmd flags proc help_text} $entry {
+      lappend cmdlist [string toupper $cmd]
+    }
+  }
+  reply $nick $dst "Commands: [join $cmdlist ", "]. Detailed help is available by /msg or dcc chat" 
+}
+
+proc c_help_priv {cmd_table tags nick dst args} {
+  foreach entry $cmd_table {
+    foreach {cmd flags proc help_text} $entry {
+      if {[flagchk $dst $flags $tags]} {
+        reply $nick $dst [format "%-10s %s" [string toupper $cmd] $help_text] 
+      }
+    }
+  }
+}
+
 proc h_cmd {nick dst msg {tags --}} {
-  # { {pattern flags proc} }
+  # { {cmd flags proc help_text} }
   # flags:
   # a - require admin
   # c - channel
   # d - dcc chat
   # p - private message
   set cmd_table {
-    { {^eval (.*)$} adp c_eval }
-    { {^op me$} ac c_op }
+    { {eval} acdp c_eval "Evaluate TCL Commands" }
+    { {op me} ac c_op {} "I'll try to MODE +o you" }
 
-    { {^chat me} cp {c_chat $tags} }
-    { {^whoami$} cdp {c_whoami $tags} }
-    { {^who$} cdp {c_who} }
-
-    { {^(?:what is\s+)?(\S+?)\??$} cdp c_info }
-    { {^(\S+)\s+is\s+(.*)} c c_define }
+    { {chat me} cp {c_chat $tags} "Have bot initiate DCC chat for partyline and control" }
+    { {help}    c  {c_help_chan $cmd_table $tags} "Get help" }
+    { {help}    dp {c_help_priv $cmd_table $tags} "Get help" }
+    { {whoami} cdp {c_whoami $tags} "Get info about your user's id and admin status"}
+    { {who}     d  {c_who} "List other users in DCC partyline" }
   }
 
   foreach entry $cmd_table {
-    foreach {pattern flags proc} $entry {
-      set args [regexp -nocase -inline -- $pattern $msg]
+    foreach {cmd flags proc help_text } $entry {
+      set args [regexp -nocase -inline -- "^${cmd}(?:\s+(.*))?$" $msg]
       if {$args != {} && [flagchk $dst $flags $tags]} {
         eval $proc $nick $dst $args
         return
       }
     }
   }
+  # idk these aren't commands so special case them
+  if {[regexp -nocase -- {^(?:what is\s+)?(\S+?)\??$} $msg -> word] && [flagchk $dst cdp]} {
+    c_info $nick $dst $word
+  } elseif {[regexp -nocase -- {^(\S+)\s+is\s+(.*)} $msg -> word def] && [flagchk $dst c]} {
+    c_define $nick $dst $word $def
+  } else {reply $nick $dst "Unknown command: \[$msg\]"}
 }
 
 proc dcc_putsall {msg} {
@@ -319,17 +364,22 @@ proc dcc_recv {sock} {
   }
 
   if {[regexp -nocase -- {^\001ACTION\s+(.*)\001$} $line -> emote]} {
-    puts "::: DCC<$nick> $line"
+    puts "\[DCC:$nick\] *** $nick $emote"
     dcc_putsall "*** $nick $emote"
   } elseif {[regexp -nocase -- {^\.(.*)$} $line -> msg]} {
+    puts "\[DCC:$nick\] <$nick> $line"
     h_cmd $nick "dcc=$sock" $msg $::dcc_tags($sock)
   } else {
-    puts "::: DCC<$nick>: $line"
+    puts "\[DCC:$nick\] <$nick> $line"
     dcc_putsall "<$nick> $line"
   }
 }
 
 proc dcc_chat_accept {sock addr port} {
+  if {[info exists ::dcc_timer]} {
+    after cancel $::dcc_timer
+    unset ::dcc_timer
+  }
   fconfigure $sock -buffering line -translation crlf
   if {$::dcc_incoming == {}} {
     puts $sock "Invites expire after 30 sec. Please try again."
@@ -407,7 +457,7 @@ proc irc_connect {} {
   fconfigure $::fd -buffering line -translation crlf
   set ::conn_state connected
 
-  send "CAP REQ :sasl account-tag"
+  send "CAP REQ :sasl account-tag chghost"
   send_nick
   send "USER tcl 0 * :tclbot"
 
