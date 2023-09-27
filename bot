@@ -292,7 +292,9 @@ proc c_help_chan {cmd_table tags nick dst args} {
   set cmdlist {}
   foreach entry $cmd_table {
     foreach {cmd flags proc help_text} $entry {
-      lappend cmdlist [string toupper $cmd]
+      if {[flagchk $dst $flags $tags]} {
+        lappend cmdlist [string toupper $cmd]
+      }
     }
   }
   reply $nick $dst "Commands: [join $cmdlist ", "]. Detailed help is available by /msg or dcc chat" 
@@ -316,8 +318,8 @@ proc h_cmd {nick dst msg {tags --}} {
   # d - dcc chat
   # p - private message
   set cmd_table {
-    { {eval} acdp c_eval "Evaluate TCL Commands" }
-    { {op me} ac c_op {} "I'll try to MODE +o you" }
+    { {eval}  acdp c_eval "Evaluate TCL Commands" }
+    { {op me}   ac c_op "I'll try to MODE +o you" }
 
     { {chat me} cp {c_chat $tags} "Have bot initiate DCC chat for partyline and control" }
     { {help}    c  {c_help_chan $cmd_table $tags} "Get help" }
@@ -328,7 +330,7 @@ proc h_cmd {nick dst msg {tags --}} {
 
   foreach entry $cmd_table {
     foreach {cmd flags proc help_text } $entry {
-      set args [regexp -nocase -inline -- "^${cmd}(?:\s+(.*))?$" $msg]
+      set args [regexp -nocase -inline -- "^${cmd}(?:\\s+(.*))?\$" $msg]
       if {$args != {} && [flagchk $dst $flags $tags]} {
         eval $proc $nick $dst $args
         return
