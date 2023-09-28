@@ -95,6 +95,7 @@ proc recv {} {
     PING {send "PONG :$rest" 1}
     PRIVMSG {cmd_privmsg $tags $src $dst $rest}
     001 {cmd_001}
+    311 {cmd_311 $rest}
     338 {cmd_338 $rest}
     433 {send_nick}
 
@@ -108,15 +109,28 @@ proc recv {} {
 }
 
 proc reply {nick dst msg} {
-  if {$dst == $::curnick} {
-    puts "\[MSG:$nick\] <$::curnick> $msg"
-    send "PRIVMSG $nick :$msg"
-  } elseif {[regexp -- {^dcc=(.*)$} $dst -> sock]} {
-    puts "\[DCC:$nick\] <$::curnick> $msg"
-    puts $sock $msg
-  } else {
-    puts "\[$dst\] <$::curnick> $nick: $msg"
-    send "PRIVMSG $dst :$nick: $msg"
+  set maxlen 498 ;#512 - " PRIVMSG " - " :" - crlf - \0
+  incr maxlen -[string length $::myprefix]
+  incr maxlen -[string length $dst]
+
+  if {[string match {#*} $dst]} {
+    incr maxlen -[string length $nick]
+    incr maxlen -2   ;# ": "
+  }
+
+  for {set i 0} {$i<[string length $msg]} {incr i $maxlen;incr i 1} {
+    set m [string range $msg $i [expr {$i+$maxlen}]]
+
+    if {$dst == $::curnick} {
+      puts "\[MSG:$nick\] <$::curnick> $m"
+      send "PRIVMSG $nick :$m"
+    } elseif {[regexp -- {^dcc=(.*)$} $dst -> sock]} {
+      puts "\[DCC:$nick\] <$::curnick> $m"
+      puts $sock $msg
+    } else {
+      puts "\[$dst\] <$::curnick> $nick: $m"
+      send "PRIVMSG $dst :$nick: $m"
+    }
   }
 }
 
@@ -129,6 +143,16 @@ proc cmd_001 {} {
   send "WHOIS $::curnick"
   foreach c $::channels {
     send "JOIN $c"
+  }
+}
+
+proc cmd_311 {rest} {
+  set args [split $rest]
+  set n [lindex $args 0]
+  set u [lindex $args 1]
+  set h [lindex $args 2]
+  if {$n == $::curnick} {
+    set ::myprefix ":${n}!${u}@${h}"
   }
 }
 
@@ -455,7 +479,7 @@ proc irc_connect {} {
   set ::sendq_allowance $::sendq_MAX
   set ::sendq {}
 
-  set ::fd [socket irc.libera.chat 6667]
+  set ::fd [socket -myport 32767 irc.libera.chat 6667]
   fconfigure $::fd -buffering line -translation crlf
   set ::conn_state connected
 
